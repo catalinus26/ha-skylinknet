@@ -1,0 +1,12 @@
+{
+  "domain": "skylinknet",
+  "name": "SkylinkNet",
+  "codeowners": ["@catalinus26"],
+  "config_flow": true,
+  "documentation": "https://github.com/catalinus26/ha-skylinknet",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/catalinus26/ha-skylinknet/issues",
+  "requirements": [],
+  "version": "0.0.1"
+}
