@@ -58,15 +58,28 @@ The integration has been tested and confirmed to work with:
 
 These systems may be sold under different brand/model names while using compatible SkylinkNet hardware and services.
 
+## Known Issues
+
+The following SkylinkNet device types are currently discovered as motion sensors:
+
+- Water sensors (`dev_type 5`)
+- Light controls (`dev_type 1`)
+- Appliance/plug controls (`dev_type 2`)
+- Remote controls (`dev_type 7`)
+
+Support for these device types is planned for future releases.
+
 ## Issues
 
-If you encounter any problems while using the integration, please [open an issue](https://github.com/catalinus26/ha-skylinknet/issues).
+If you encounter a problem that is not listed under **Known Issues**, please [open an issue](https://github.com/catalinus26/ha-skylinknet/issues).
 
 Be sure to include as much relevant information as possible. This helps with troubleshooting and speeds up the resolution process.
 
 ## Disclaimer
 
 This is an unofficial integration and is not affiliated with SkylinkNet. Use at your own risk.
+
+
 
 ## Buy me a beer 🍺
 
