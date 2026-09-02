@@ -171,14 +171,20 @@ async def async_setup_entry(
     )
 
     # ============================================================
-    # WEBSOCKET SENSOR
+    # HUB ALARM / WEBSOCKET ENTITIES
     # ============================================================
 
     async_add_entities(
         [
             SkylinkNetWebSocketSensor(
                 coordinator
-            )
+            ),
+            SkylinkNetAlarmArmedSensor(
+                coordinator
+            ),
+            SkylinkNetAlarmTriggeredSensor(
+                coordinator
+            ),
         ]
     )
 
@@ -365,6 +371,142 @@ class SkylinkNetWebSocketSensor(
         self,
     ) -> None:
         """Handle WebSocket state change."""
+
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(
+        self,
+    ) -> None:
+        """Remove listener."""
+
+        self.coordinator.remove_monitor_listener(
+            self._state_changed
+        )
+
+        await super().async_will_remove_from_hass()
+
+
+# ============================================================
+# ALARM ARMED
+# ============================================================
+
+class SkylinkNetAlarmArmedSensor(
+    BinarySensorEntity
+):
+    """SkylinkNet alarm armed status."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Alarm Armed"
+    _attr_should_poll = False
+    _attr_icon = "mdi:shield-lock"
+
+    def __init__(
+        self,
+        coordinator: SkylinkNetCoordinator,
+    ) -> None:
+        """Initialize."""
+
+        self.coordinator = coordinator
+
+        self._attr_unique_id = (
+            f"skylinknet_"
+            f"{coordinator.api.hub_id}"
+            "_alarm_armed"
+        )
+
+        self._attr_device_info = (
+            coordinator.hub_device_info
+        )
+
+        coordinator.add_monitor_listener(
+            self._state_changed
+        )
+
+    @property
+    def is_on(
+        self,
+    ) -> bool:
+        """Return true when alarm is armed."""
+
+        return self.coordinator._arming_mode in (
+            "armed_home",
+            "armed_away",
+        )
+
+    @callback
+    def _state_changed(
+        self,
+    ) -> None:
+        """Handle alarm state change."""
+
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(
+        self,
+    ) -> None:
+        """Remove listener."""
+
+        self.coordinator.remove_monitor_listener(
+            self._state_changed
+        )
+
+        await super().async_will_remove_from_hass()
+
+
+# ============================================================
+# ALARM TRIGGERED
+# ============================================================
+
+class SkylinkNetAlarmTriggeredSensor(
+    BinarySensorEntity
+):
+    """SkylinkNet alarm triggered status."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Alarm Triggered"
+    _attr_should_poll = False
+    _attr_device_class = (
+        BinarySensorDeviceClass.PROBLEM
+    )
+
+    def __init__(
+        self,
+        coordinator: SkylinkNetCoordinator,
+    ) -> None:
+        """Initialize."""
+
+        self.coordinator = coordinator
+
+        self._attr_unique_id = (
+            f"skylinknet_"
+            f"{coordinator.api.hub_id}"
+            "_alarm_triggered"
+        )
+
+        self._attr_device_info = (
+            coordinator.hub_device_info
+        )
+
+        coordinator.add_monitor_listener(
+            self._state_changed
+        )
+
+    @property
+    def is_on(
+        self,
+    ) -> bool:
+        """Return true when alarm is triggered."""
+
+        return (
+            self.coordinator.alarm_state
+            == "triggered"
+        )
+
+    @callback
+    def _state_changed(
+        self,
+    ) -> None:
+        """Handle alarm state change."""
 
         self.async_write_ha_state()
 
