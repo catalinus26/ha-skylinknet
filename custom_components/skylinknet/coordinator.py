@@ -136,6 +136,14 @@ class SkylinkNetCoordinator:
 
         self._entry_delay = False
 
+        # True while waiting for status=3 confirming
+        # completion of an Away arming operation.
+        #
+        # This is important because status=7 followed by
+        # status=3 is also received when the user arms the
+        # system directly from the SkylinkNet mobile app.
+        self._awaiting_arm_away_confirmation = False
+
     # ============================================================
     # START
     # ============================================================
@@ -895,6 +903,7 @@ class SkylinkNetCoordinator:
 
             self._exit_delay = False
             self._entry_delay = False
+            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "disarmed"
 
@@ -912,6 +921,7 @@ class SkylinkNetCoordinator:
 
             self._exit_delay = False
             self._entry_delay = False
+            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "armed_home"
 
@@ -930,6 +940,11 @@ class SkylinkNetCoordinator:
             self._exit_delay = True
             self._entry_delay = False
 
+            # Status 7 starts the Away exit delay.
+            # Status 3 received afterwards confirms that
+            # the exit delay has completed.
+            self._awaiting_arm_away_confirmation = True
+
             self.alarm_state = "arming"
 
             self._notify_monitor_listeners()
@@ -939,48 +954,50 @@ class SkylinkNetCoordinator:
         # ========================================================
         # STATUS 3
         #
-        # 3 = stable Armed Away
+        # 3 = Armed Away.
         #
         # When received after status=7, it means the exit delay
         # has completed.
         #
-        # When received while already armed, it may represent
+        # When received while already stably armed and there was
+        # no preceding arm-away transition, it may represent
         # Entry Delay.
         # ========================================================
 
         if status == ALARM_STATUS_ARMED_AWAY:
 
-            if self._arming_mode == "armed_away":
-
-                if self._exit_delay:
-
-                    self._exit_delay = False
-                    self._entry_delay = False
-
-                    self.alarm_state = (
-                        "armed_away"
-                    )
-
-                else:
-
-                    self._entry_delay = True
-
-                    self.alarm_state = (
-                        "pending"
-                    )
-
-            else:
-
-                self._arming_mode = (
-                    "armed_away"
-                )
+            if (
+                self._awaiting_arm_away_confirmation
+                or self._exit_delay
+            ):
+                # Exit delay completed.
+                self._arming_mode = "armed_away"
 
                 self._exit_delay = False
                 self._entry_delay = False
+                self._awaiting_arm_away_confirmation = False
 
-                self.alarm_state = (
-                    "armed_away"
-                )
+                self.alarm_state = "armed_away"
+
+            elif self._arming_mode == "armed_away":
+                # Already armed away.
+                # Status 3 can represent Entry Delay.
+                self._entry_delay = True
+
+                self.alarm_state = "pending"
+
+            else:
+                # Initial/fallback status 3.
+                #
+                # This is also important after Home Assistant
+                # restarts while the alarm is already armed away.
+                self._arming_mode = "armed_away"
+
+                self._exit_delay = False
+                self._entry_delay = False
+                self._awaiting_arm_away_confirmation = False
+
+                self.alarm_state = "armed_away"
 
             self._notify_monitor_listeners()
 
@@ -1004,6 +1021,7 @@ class SkylinkNetCoordinator:
 
             self._exit_delay = False
             self._entry_delay = False
+            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "triggered"
 
@@ -1019,6 +1037,7 @@ class SkylinkNetCoordinator:
 
             self._exit_delay = False
             self._entry_delay = False
+            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "triggered"
 
@@ -1128,6 +1147,7 @@ class SkylinkNetCoordinator:
 
                 self._exit_delay = False
                 self._entry_delay = False
+                self._awaiting_arm_away_confirmation = False
 
                 self.alarm_state = "disarmed"
 
@@ -1141,6 +1161,7 @@ class SkylinkNetCoordinator:
 
                 self._exit_delay = False
                 self._entry_delay = False
+                self._awaiting_arm_away_confirmation = False
 
                 self.alarm_state = "armed_home"
 
@@ -1154,6 +1175,7 @@ class SkylinkNetCoordinator:
 
                 self._exit_delay = False
                 self._entry_delay = False
+                self._awaiting_arm_away_confirmation = False
 
                 self.alarm_state = "armed_away"
 
@@ -1584,6 +1606,10 @@ class SkylinkNetCoordinator:
             )
 
             self._entry_delay = False
+
+            self._awaiting_arm_away_confirmation = (
+                alarm == "arm_away"
+            )
 
             self.alarm_state = (
                 "arming"
