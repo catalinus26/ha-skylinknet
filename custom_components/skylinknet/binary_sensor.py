@@ -19,8 +19,12 @@ from .const import (
     ATTR_DEVICE_ID,
     CONF_DEFAULT_DEVICE_CLASS,
     DEFAULT_DEVICE_CLASS,
+    DEV_TYPE_APPLIANCE,
     DEV_TYPE_DOOR,
+    DEV_TYPE_LIGHT,
     DEV_TYPE_MOTION,
+    DEV_TYPE_REMOTE,
+    DEV_TYPE_WATER,
     DEV_TYPE_WINDOW,
     DEVICE_CLASS_NONE,
     DOMAIN,
@@ -33,9 +37,18 @@ from .coordinator import SkylinkNetCoordinator
 # ============================================================
 
 _DEV_TYPE_CLASS_MAP = {
+    DEV_TYPE_LIGHT: BinarySensorDeviceClass.LIGHT,
+    DEV_TYPE_APPLIANCE: BinarySensorDeviceClass.PLUG,
     DEV_TYPE_DOOR: BinarySensorDeviceClass.DOOR,
-    DEV_TYPE_WINDOW: BinarySensorDeviceClass.WINDOW,
+    DEV_TYPE_WATER: BinarySensorDeviceClass.MOISTURE,
     DEV_TYPE_MOTION: BinarySensorDeviceClass.MOTION,
+    # Remote controls report button presses, not a persistent
+    # open/closed or on/off state, so none of the existing device
+    # classes fit. Map it explicitly to "no device class" rather
+    # than letting it fall through to the configured default
+    # (which would mislabel it as e.g. a motion sensor).
+    DEV_TYPE_REMOTE: None,
+    DEV_TYPE_WINDOW: BinarySensorDeviceClass.WINDOW,
 }
 
 
@@ -171,15 +184,12 @@ async def async_setup_entry(
     )
 
     # ============================================================
-    # HUB ALARM / WEBSOCKET ENTITIES
+    # WEBSOCKET SENSOR
     # ============================================================
 
     async_add_entities(
         [
             SkylinkNetWebSocketSensor(
-                coordinator
-            ),
-            SkylinkNetAlarmArmedSensor(
                 coordinator
             ),
             SkylinkNetAlarmTriggeredSensor(
@@ -387,87 +397,28 @@ class SkylinkNetWebSocketSensor(
 
 
 # ============================================================
-# ALARM ARMED
-# ============================================================
-
-class SkylinkNetAlarmArmedSensor(
-    BinarySensorEntity
-):
-    """SkylinkNet alarm armed status."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Alarm Armed"
-    _attr_should_poll = False
-    _attr_icon = "mdi:shield-lock"
-
-    def __init__(
-        self,
-        coordinator: SkylinkNetCoordinator,
-    ) -> None:
-        """Initialize."""
-
-        self.coordinator = coordinator
-
-        self._attr_unique_id = (
-            f"skylinknet_"
-            f"{coordinator.api.hub_id}"
-            "_alarm_armed"
-        )
-
-        self._attr_device_info = (
-            coordinator.hub_device_info
-        )
-
-        coordinator.add_monitor_listener(
-            self._state_changed
-        )
-
-    @property
-    def is_on(
-        self,
-    ) -> bool:
-        """Return true when alarm is armed."""
-
-        return self.coordinator._arming_mode in (
-            "armed_home",
-            "armed_away",
-        )
-
-    @callback
-    def _state_changed(
-        self,
-    ) -> None:
-        """Handle alarm state change."""
-
-        self.async_write_ha_state()
-
-    async def async_will_remove_from_hass(
-        self,
-    ) -> None:
-        """Remove listener."""
-
-        self.coordinator.remove_monitor_listener(
-            self._state_changed
-        )
-
-        await super().async_will_remove_from_hass()
-
-
-# ============================================================
-# ALARM TRIGGERED
+# ALARM TRIGGERED SENSOR
 # ============================================================
 
 class SkylinkNetAlarmTriggeredSensor(
     BinarySensorEntity
 ):
-    """SkylinkNet alarm triggered status."""
+    """On while the SkylinkNet alarm is in the 'triggered' state.
+
+    Mirrors coordinator.alarm_state so automations/dashboards don't
+    need to watch the alarm_control_panel entity's state string
+    directly. It goes on only once the entry/exit delay has expired
+    and the hub confirms a real trigger (status 5/6), not merely
+    while a sensor is open during the delay window ("pending").
+    """
+
+    _attr_device_class = (
+        BinarySensorDeviceClass.SAFETY
+    )
 
     _attr_has_entity_name = True
     _attr_name = "Alarm Triggered"
     _attr_should_poll = False
-    _attr_device_class = (
-        BinarySensorDeviceClass.PROBLEM
-    )
 
     def __init__(
         self,
@@ -495,7 +446,7 @@ class SkylinkNetAlarmTriggeredSensor(
     def is_on(
         self,
     ) -> bool:
-        """Return true when alarm is triggered."""
+        """Return true while the alarm is triggered."""
 
         return (
             self.coordinator.alarm_state
@@ -506,7 +457,7 @@ class SkylinkNetAlarmTriggeredSensor(
     def _state_changed(
         self,
     ) -> None:
-        """Handle alarm state change."""
+        """Handle coordinator update."""
 
         self.async_write_ha_state()
 

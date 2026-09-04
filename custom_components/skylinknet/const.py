@@ -21,8 +21,12 @@ REQUEST_TIMEOUT = 20
 # DEVICE TYPES (SkylinkNet "dev_type" field)
 # ============================================================
 
+DEV_TYPE_LIGHT = 1
+DEV_TYPE_APPLIANCE = 2
 DEV_TYPE_DOOR = 4
+DEV_TYPE_WATER = 5
 DEV_TYPE_MOTION = 6
+DEV_TYPE_REMOTE = 7
 DEV_TYPE_WINDOW = 11
 
 # ============================================================

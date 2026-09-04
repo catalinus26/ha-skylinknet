@@ -38,6 +38,27 @@ INITIAL_RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 300
 WS_HEARTBEAT = 30
 
+# ============================================================
+# ARM CONFIRMATION SAFETY NET
+#
+# When arming is requested (from Home Assistant OR from the
+# SkylinkNet app / another client), the alarm briefly goes
+# through a transient state ("arming" = exit delay, "pending" =
+# entry delay) before the hub is expected to push a WebSocket
+# confirmation for the virtual alarm device (F0000000) with the
+# final status (2/3/4).
+#
+# In practice this confirmation does not always arrive over the
+# WebSocket (e.g. depending on how the arm was triggered), which
+# left the entity stuck showing "arming"/"pending" forever even
+# though the alarm had actually finished arming. To guard against
+# this, a watchdog is started whenever we enter a transient state;
+# if no WebSocket confirmation clears it in time, we fall back to
+# polling the REST API for the real status.
+# ============================================================
+
+ARM_CONFIRM_TIMEOUT = 60
+
 
 # ============================================================
 # VIRTUAL ALARM DEVICE
@@ -76,6 +97,10 @@ class SkylinkNetCoordinator:
 
         self._task: asyncio.Task | None = None
         self._stop = False
+
+        # Safety-net watchdog for transient arm/entry-delay states
+        # (see ARM_CONFIRM_TIMEOUT above).
+        self._arm_confirm_task: asyncio.Task | None = None
 
         self._ssl_context: ssl.SSLContext | None = None
 
@@ -136,14 +161,6 @@ class SkylinkNetCoordinator:
 
         self._entry_delay = False
 
-        # True while waiting for status=3 confirming
-        # completion of an Away arming operation.
-        #
-        # This is important because status=7 followed by
-        # status=3 is also received when the user arms the
-        # system directly from the SkylinkNet mobile app.
-        self._awaiting_arm_away_confirmation = False
-
     # ============================================================
     # START
     # ============================================================
@@ -180,6 +197,8 @@ class SkylinkNetCoordinator:
         """Stop coordinator."""
 
         self._stop = True
+
+        self._cancel_arm_confirmation()
 
         if self._task is not None:
             self._task.cancel()
@@ -277,6 +296,75 @@ class SkylinkNetCoordinator:
                 _LOGGER.exception(
                     "SkylinkNet monitor listener error"
                 )
+
+    # ============================================================
+    # ARM CONFIRMATION SAFETY NET
+    # ============================================================
+
+    def _schedule_arm_confirmation(self) -> None:
+        """(Re)start the watchdog while alarm_state is transient.
+
+        Called every time we enter or re-enter "arming" (exit
+        delay) or "pending" (entry delay). If the hub never sends
+        a WebSocket confirmation for the virtual alarm device
+        before ARM_CONFIRM_TIMEOUT elapses, the watchdog polls the
+        REST API so the entity does not stay stuck indefinitely.
+        """
+
+        self._cancel_arm_confirmation()
+
+        self._arm_confirm_task = (
+            self.hass.async_create_background_task(
+                self._arm_confirmation_watchdog(),
+                name="skylinknet_arm_confirmation",
+            )
+        )
+
+    def _cancel_arm_confirmation(self) -> None:
+        """Cancel any pending arm-confirmation watchdog."""
+
+        if (
+            self._arm_confirm_task is not None
+            and not self._arm_confirm_task.done()
+        ):
+            self._arm_confirm_task.cancel()
+
+        self._arm_confirm_task = None
+
+    async def _arm_confirmation_watchdog(self) -> None:
+        """Fall back to REST polling if no WS confirmation arrives."""
+
+        try:
+            await asyncio.sleep(ARM_CONFIRM_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+
+        if self.alarm_state not in (
+            "arming",
+            "pending",
+        ):
+            # A WebSocket message already resolved the transient
+            # state (or cancelled this watchdog); nothing to do.
+            return
+
+        _LOGGER.warning(
+            "SkylinkNet: no WebSocket confirmation received "
+            "within %s seconds while alarm_state=%s, "
+            "falling back to REST status check",
+            ARM_CONFIRM_TIMEOUT,
+            self.alarm_state,
+        )
+
+        try:
+            read = await self.api.read_devices()
+        except Exception as err:
+            _LOGGER.error(
+                "SkylinkNet arm-confirmation REST check failed: %s",
+                err,
+            )
+            return
+
+        self.update_alarm_state_from_read(read)
 
     # ============================================================
     # PERSISTENCE
@@ -899,11 +987,12 @@ class SkylinkNetCoordinator:
 
         if status == ALARM_STATUS_DISARMED:
 
+            self._cancel_arm_confirmation()
+
             self._arming_mode = "disarmed"
 
             self._exit_delay = False
             self._entry_delay = False
-            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "disarmed"
 
@@ -917,11 +1006,12 @@ class SkylinkNetCoordinator:
 
         if status == ALARM_CODE_ARMED_HOME:
 
+            self._cancel_arm_confirmation()
+
             self._arming_mode = "armed_home"
 
             self._exit_delay = False
             self._entry_delay = False
-            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "armed_home"
 
@@ -940,12 +1030,9 @@ class SkylinkNetCoordinator:
             self._exit_delay = True
             self._entry_delay = False
 
-            # Status 7 starts the Away exit delay.
-            # Status 3 received afterwards confirms that
-            # the exit delay has completed.
-            self._awaiting_arm_away_confirmation = True
-
             self.alarm_state = "arming"
+
+            self._schedule_arm_confirmation()
 
             self._notify_monitor_listeners()
 
@@ -954,50 +1041,54 @@ class SkylinkNetCoordinator:
         # ========================================================
         # STATUS 3
         #
-        # 3 = Armed Away.
+        # 3 = stable Armed Away
         #
         # When received after status=7, it means the exit delay
         # has completed.
         #
-        # When received while already stably armed and there was
-        # no preceding arm-away transition, it may represent
+        # When received while already armed, it may represent
         # Entry Delay.
         # ========================================================
 
         if status == ALARM_STATUS_ARMED_AWAY:
 
-            if (
-                self._awaiting_arm_away_confirmation
-                or self._exit_delay
-            ):
-                # Exit delay completed.
-                self._arming_mode = "armed_away"
+            if self._arming_mode == "armed_away":
 
-                self._exit_delay = False
-                self._entry_delay = False
-                self._awaiting_arm_away_confirmation = False
+                if self._exit_delay:
 
-                self.alarm_state = "armed_away"
+                    self._cancel_arm_confirmation()
 
-            elif self._arming_mode == "armed_away":
-                # Already armed away.
-                # Status 3 can represent Entry Delay.
-                self._entry_delay = True
+                    self._exit_delay = False
+                    self._entry_delay = False
 
-                self.alarm_state = "pending"
+                    self.alarm_state = (
+                        "armed_away"
+                    )
+
+                else:
+
+                    self._entry_delay = True
+
+                    self.alarm_state = (
+                        "pending"
+                    )
+
+                    self._schedule_arm_confirmation()
 
             else:
-                # Initial/fallback status 3.
-                #
-                # This is also important after Home Assistant
-                # restarts while the alarm is already armed away.
-                self._arming_mode = "armed_away"
+
+                self._cancel_arm_confirmation()
+
+                self._arming_mode = (
+                    "armed_away"
+                )
 
                 self._exit_delay = False
                 self._entry_delay = False
-                self._awaiting_arm_away_confirmation = False
 
-                self.alarm_state = "armed_away"
+                self.alarm_state = (
+                    "armed_away"
+                )
 
             self._notify_monitor_listeners()
 
@@ -1019,9 +1110,10 @@ class SkylinkNetCoordinator:
                 )
                 return
 
+            self._cancel_arm_confirmation()
+
             self._exit_delay = False
             self._entry_delay = False
-            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "triggered"
 
@@ -1035,9 +1127,10 @@ class SkylinkNetCoordinator:
 
         if status == ALARM_STATUS_TRIGGERED:
 
+            self._cancel_arm_confirmation()
+
             self._exit_delay = False
             self._entry_delay = False
-            self._awaiting_arm_away_confirmation = False
 
             self.alarm_state = "triggered"
 
@@ -1147,7 +1240,6 @@ class SkylinkNetCoordinator:
 
                 self._exit_delay = False
                 self._entry_delay = False
-                self._awaiting_arm_away_confirmation = False
 
                 self.alarm_state = "disarmed"
 
@@ -1161,7 +1253,6 @@ class SkylinkNetCoordinator:
 
                 self._exit_delay = False
                 self._entry_delay = False
-                self._awaiting_arm_away_confirmation = False
 
                 self.alarm_state = "armed_home"
 
@@ -1175,7 +1266,6 @@ class SkylinkNetCoordinator:
 
                 self._exit_delay = False
                 self._entry_delay = False
-                self._awaiting_arm_away_confirmation = False
 
                 self.alarm_state = "armed_away"
 
@@ -1607,15 +1697,16 @@ class SkylinkNetCoordinator:
 
             self._entry_delay = False
 
-            self._awaiting_arm_away_confirmation = (
-                alarm == "arm_away"
-            )
-
             self.alarm_state = (
                 "arming"
                 if self._exit_delay
                 else arming_mode
             )
+
+            if self.alarm_state == "arming":
+                self._schedule_arm_confirmation()
+            else:
+                self._cancel_arm_confirmation()
 
             self._notify_monitor_listeners()
 
