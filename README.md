@@ -60,10 +60,9 @@ These systems may be sold under different brand/model names while using compatib
 
 ## Known Issues
 
-The following SkylinkNet device types are currently discovered as motion sensors:
+The following SkylinkNet device types are currently discovered as sensors:
 
-- Water sensors (`dev_type 5`)
-- Light controls (`dev_type 1`)
+- Light controls (`dev_type 1`) - 
 - Appliance/plug controls (`dev_type 2`)
 - Remote controls (`dev_type 7`)
 
