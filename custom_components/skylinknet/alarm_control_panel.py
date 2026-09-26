@@ -110,6 +110,20 @@ class SkylinkNetAlarmControlPanel(AlarmControlPanelEntity):
             AlarmControlPanelState.DISARMED,
         )
 
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose diagnostics for the last arm/disarm command.
+
+        Only what the protocol actually confirmed (command, result,
+        confirmation source/time, final state) — never a claim about
+        whether bypass was applied, since that is not confirmed by
+        the current protocol responses. Contains no credentials.
+        """
+
+        last_arm = self.coordinator.get_last_arm_info()
+
+        return {"last_arm": last_arm} if last_arm else {}
+
     # ============================================================
     # DISARM
     # ============================================================

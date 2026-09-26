@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -19,7 +18,7 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
-from .api import SkylinkNetApi, SkylinkNetAuthError
+from .api import SkylinkNetApi, SkylinkNetAuthError, SkylinkNetError
 from .const import (
     CONF_DEFAULT_DEVICE_CLASS,
     DEFAULT_DEVICE_CLASS,
@@ -43,6 +42,37 @@ DEVICE_CLASS_OPTIONS = [
     BinarySensorDeviceClass.OPENING.value,
     BinarySensorDeviceClass.MOISTURE.value,
 ]
+
+
+# ============================================================
+# SHARED ERROR HANDLING
+#
+# Separates:
+#   - wrong account credentials         -> "invalid_auth"
+#   - everything else (timeout, DNS,
+#     TLS, non-2xx, malformed JSON,
+#     wrong hub_id/hub_key)             -> "cannot_connect"
+#
+# Every SkylinkNetError message is already sanitized (see api.py /
+# sanitize.py), so it is safe to use in _LOGGER.debug for support
+# purposes; it is never shown to the user (only the translated
+# "base" error key is).
+# ============================================================
+
+
+def _map_error(err: Exception) -> str:
+    """Return the config-flow error key for an exception."""
+
+    if isinstance(err, SkylinkNetAuthError):
+        return "invalid_auth"
+
+    if isinstance(err, (SkylinkNetError, KeyError, ValueError)):
+        return "cannot_connect"
+
+    # Anything else is a genuine bug: re-raise so it surfaces in the
+    # logs instead of being silently mapped to a translated string
+    # that would hide it.
+    raise err
 
 
 class SkylinkNetConfigFlow(
@@ -75,11 +105,18 @@ class SkylinkNetConfigFlow(
 
                 await api.login()
 
-            except (aiohttp.ClientError, KeyError, ValueError):
-                errors["base"] = "cannot_connect"
+                # Validate hub_id/hub_key too (v0.0.2 only checked the
+                # account login here, so a wrong hub key was only
+                # discovered at integration setup). See
+                # SkylinkNetApi.validate_hub() for what is and is not
+                # confirmed by this call.
+                api.hub_id = user_input["hub_id"]
+                api.hub_key = user_input["hub_key"]
 
-            except SkylinkNetAuthError:
-                errors["base"] = "invalid_auth"
+                await api.validate_hub()
+
+            except Exception as err:  # noqa: BLE001
+                errors["base"] = _map_error(err)
 
             else:
                 hub_id = user_input["hub_id"]
@@ -157,11 +194,8 @@ class SkylinkNetConfigFlow(
 
                 await api.login()
 
-            except (aiohttp.ClientError, KeyError, ValueError):
-                errors["base"] = "cannot_connect"
-
-            except SkylinkNetAuthError:
-                errors["base"] = "invalid_auth"
+            except Exception as err:  # noqa: BLE001
+                errors["base"] = _map_error(err)
 
             else:
                 new_data = {

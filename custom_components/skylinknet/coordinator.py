@@ -17,6 +17,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .api import SkylinkNetApi
+from .sanitize import sanitize_exception
 from .const import (
     ALARM_CODE_ARMED_AWAY,
     ALARM_CODE_ARMED_HOME,
@@ -28,6 +29,12 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _iso(value: datetime | None) -> str | None:
+    """Render a datetime as ISO-8601, or None, for diagnostics output."""
+
+    return value.isoformat() if value else None
 
 
 # ============================================================
@@ -59,6 +66,17 @@ WS_HEARTBEAT = 30
 
 ARM_CONFIRM_TIMEOUT = 60
 
+# Extra, bounded retries of the REST fallback check when it fails
+# (e.g. transient network error). This does NOT change how long it
+# takes to fall back the FIRST time (still ARM_CONFIRM_TIMEOUT); it
+# only stops a single failed REST call from leaving the entity stuck
+# in "arming"/"pending" until the next full reconnect/resync. It is
+# intentionally short and bounded so it can never become the
+# "aggressive polling" the spec forbids. If every attempt fails, the
+# alarm_state is left exactly as it was (arming/pending) — the
+# watchdog never guesses a final state.
+ARM_CONFIRM_RETRY_DELAYS = (15, 30)
+
 
 # ============================================================
 # VIRTUAL ALARM DEVICE
@@ -76,6 +94,10 @@ ALARM_STATUS_ARMED_AWAY = ALARM_CODE_ARMED_AWAY
 ALARM_STATUS_DISARMED = ALARM_CODE_DISARMED
 ALARM_STATUS_TRIGGERED_OPEN_ZONE = 5
 ALARM_STATUS_TRIGGERED = 6
+
+# alarm_state values considered "transient": the watchdog and the
+# resync logic treat these as "not yet confirmed".
+TRANSIENT_ALARM_STATES = ("arming", "pending")
 
 
 class SkylinkNetCoordinator:
@@ -137,6 +159,30 @@ class SkylinkNetCoordinator:
         self.websocket_message_count = 0
         self.websocket_error_count = 0
 
+        # ------------------------------------------------------
+        # Finer-grained diagnostics (see get_websocket_info()).
+        #
+        # - "last_activity"    any inbound WS message (any type).
+        # - "last_heartbeat"   a PING/PONG frame that actually
+        #                      surfaced in the receive loop. With
+        #                      aiohttp autoping=True, PING/PONG are
+        #                      normally consumed internally and will
+        #                      NOT appear here — this counter simply
+        #                      stays at 0 in that case, which is
+        #                      expected and not an error.
+        # - "last_useful_message" a TEXT/BINARY message that could be
+        #                      decoded as JSON (i.e. actually used).
+        # - "invalid_message_count" TEXT/BINARY that failed to decode.
+        # ------------------------------------------------------
+
+        self.websocket_heartbeat_count = 0
+        self.websocket_invalid_message_count = 0
+
+        self.websocket_last_heartbeat: datetime | None = None
+        self.websocket_last_useful_message: datetime | None = None
+
+        self.websocket_last_error_kind: str | None = None
+
         self._had_first_connection = False
 
         self.websocket_last_connect: datetime | None = None
@@ -149,6 +195,14 @@ class SkylinkNetCoordinator:
             INITIAL_RECONNECT_DELAY
         )
 
+        # ------------------------------------------------------
+        # WebSocket -> REST resync (see _resync_after_connect()).
+        # Single-flight: a lock, not a flag, so a resync already in
+        # flight is simply awaited/skipped rather than started twice.
+        # ------------------------------------------------------
+
+        self._resync_lock = asyncio.Lock()
+
         # ========================================================
         # ALARM
         # ========================================================
@@ -160,6 +214,10 @@ class SkylinkNetCoordinator:
         self._exit_delay = False
 
         self._entry_delay = False
+
+        # Diagnostics for the last arm/disarm command (see
+        # _note_arm_requested() / _note_arm_confirmed()).
+        self.last_arm: dict[str, Any] | None = None
 
     # ============================================================
     # START
@@ -331,18 +389,94 @@ class SkylinkNetCoordinator:
 
         self._arm_confirm_task = None
 
+    # ============================================================
+    # LAST ARM DIAGNOSTICS
+    #
+    # Tracks only what the protocol actually confirmed:
+    #   command / requested_at / result (REST accepted or not) /
+    #   confirmed_at / confirmed_via / final_state.
+    # It never claims bypass was applied — bypass="1" is forwarded
+    # to the API unchanged, but whether the hub honoured it is not
+    # observable from these responses (see set_alarm()/api.py).
+    # ============================================================
+
+    def _note_arm_requested(
+        self,
+        command: str,
+    ) -> None:
+        """Start tracking a newly-requested arm/disarm command."""
+
+        self.last_arm = {
+            "command": command,
+            "requested_at": dt_util.utcnow(),
+            "result": None,
+            "confirmed_at": None,
+            "confirmed_via": None,
+            "final_state": None,
+        }
+
+    def _note_arm_result(
+        self,
+        result: str,
+    ) -> None:
+        """Record whether the REST call itself was accepted."""
+
+        if self.last_arm is not None:
+            self.last_arm["result"] = result
+
+    def _note_arm_confirmed(
+        self,
+        confirmed_via: str,
+    ) -> None:
+        """Record that alarm_state settled on a non-transient value.
+
+        No-op if there is no pending command, or if this command was
+        already confirmed once (a later unrelated status change must
+        not overwrite the confirmation of the command it belongs to).
+        """
+
+        arm = self.last_arm
+
+        if arm is None or arm.get("confirmed_at") is not None:
+            return
+
+        arm["confirmed_at"] = dt_util.utcnow()
+        arm["confirmed_via"] = confirmed_via
+        arm["final_state"] = self.alarm_state
+
+    def _note_arm_confirmation_failed(
+        self,
+        error: str | None,
+    ) -> None:
+        """Record that the watchdog gave up without confirming."""
+
+        arm = self.last_arm
+
+        if arm is None or arm.get("confirmed_at") is not None:
+            return
+
+        arm["confirmation_failed"] = True
+        arm["last_confirmation_error"] = error
+
     async def _arm_confirmation_watchdog(self) -> None:
-        """Fall back to REST polling if no WS confirmation arrives."""
+        """Fall back to REST polling if no WS confirmation arrives.
+
+        Behaviour vs. v0.0.2: a single failed REST check no longer
+        leaves the entity stuck in "arming"/"pending" until the next
+        reconnect — it is retried a small, bounded number of times
+        (ARM_CONFIRM_RETRY_DELAYS), a few seconds apart. This is NOT
+        aggressive polling (at most 3 REST calls total, several
+        seconds apart) and it NEVER guesses a final state: if every
+        attempt fails, alarm_state is left exactly as it was and the
+        failure is only recorded in diagnostics (last_arm).
+        """
 
         try:
             await asyncio.sleep(ARM_CONFIRM_TIMEOUT)
         except asyncio.CancelledError:
             return
 
-        if self.alarm_state not in (
-            "arming",
-            "pending",
-        ):
+        if self.alarm_state not in TRANSIENT_ALARM_STATES:
             # A WebSocket message already resolved the transient
             # state (or cancelled this watchdog); nothing to do.
             return
@@ -355,16 +489,61 @@ class SkylinkNetCoordinator:
             self.alarm_state,
         )
 
-        try:
-            read = await self.api.read_devices()
-        except Exception as err:
-            _LOGGER.error(
-                "SkylinkNet arm-confirmation REST check failed: %s",
-                err,
+        delays = (0, *ARM_CONFIRM_RETRY_DELAYS)
+        attempts = len(delays)
+        last_err: str | None = None
+
+        for attempt, delay in enumerate(delays, start=1):
+
+            if delay:
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return
+
+                if self.alarm_state not in TRANSIENT_ALARM_STATES:
+                    return
+
+            try:
+                read = await self.api.read_devices()
+
+            except asyncio.CancelledError:
+                return
+
+            except Exception as err:
+                last_err = sanitize_exception(
+                    err,
+                    self.api.secrets,
+                )
+
+                _LOGGER.warning(
+                    "SkylinkNet arm-confirmation REST check failed "
+                    "(attempt %s/%s): %s",
+                    attempt,
+                    attempts,
+                    last_err,
+                )
+
+                continue
+
+            self.update_alarm_state_from_read(
+                read,
+                confirmed_via="rest_watchdog",
             )
+
             return
 
-        self.update_alarm_state_from_read(read)
+        _LOGGER.error(
+            "SkylinkNet could not confirm the alarm state after %s "
+            "REST attempts (still %s); last error: %s. Giving up "
+            "without guessing the final state — a WebSocket event or "
+            "the next reconnect resync will correct it.",
+            attempts,
+            self.alarm_state,
+            last_err,
+        )
+
+        self._note_arm_confirmation_failed(last_err)
 
     # ============================================================
     # PERSISTENCE
@@ -615,10 +794,17 @@ class SkylinkNetCoordinator:
                         self.websocket_last_error = (
                             None
                         )
+                        self.websocket_last_error_kind = None
 
                         _LOGGER.info(
                             "SkylinkNet WebSocket CONNECTED"
                         )
+
+                        # REST resync before consuming any live event,
+                        # so a snapshot can never overwrite a WebSocket
+                        # event that arrived after it (see
+                        # _resync_after_connect()).
+                        await self._resync_after_connect()
 
                         async for message in ws:
 
@@ -635,9 +821,14 @@ class SkylinkNetCoordinator:
                                 message.type
                                 == aiohttp.WSMsgType.TEXT
                             ):
-                                self._process_message(
+                                if self._process_message(
                                     message.data
-                                )
+                                ):
+                                    self.websocket_last_useful_message = (
+                                        dt_util.utcnow()
+                                    )
+                                else:
+                                    self.websocket_invalid_message_count += 1
 
                             elif (
                                 message.type
@@ -650,11 +841,18 @@ class SkylinkNetCoordinator:
                                         )
                                     )
 
-                                    self._process_message(
+                                    if self._process_message(
                                         text
-                                    )
+                                    ):
+                                        self.websocket_last_useful_message = (
+                                            dt_util.utcnow()
+                                        )
+                                    else:
+                                        self.websocket_invalid_message_count += 1
 
                                 except Exception:
+                                    self.websocket_invalid_message_count += 1
+
                                     _LOGGER.debug(
                                         "SkylinkNet binary message"
                                     )
@@ -663,6 +861,16 @@ class SkylinkNetCoordinator:
                                 message.type
                                 == aiohttp.WSMsgType.PING
                             ):
+                                # With autoping=True this branch is not
+                                # normally reached (aiohttp answers the
+                                # PING internally before the message
+                                # reaches this loop); it is only counted
+                                # here for completeness/diagnostics.
+                                self.websocket_heartbeat_count += 1
+                                self.websocket_last_heartbeat = (
+                                    dt_util.utcnow()
+                                )
+
                                 _LOGGER.debug(
                                     "SkylinkNet WebSocket PING"
                                 )
@@ -671,6 +879,11 @@ class SkylinkNetCoordinator:
                                 message.type
                                 == aiohttp.WSMsgType.PONG
                             ):
+                                self.websocket_heartbeat_count += 1
+                                self.websocket_last_heartbeat = (
+                                    dt_util.utcnow()
+                                )
+
                                 _LOGGER.debug(
                                     "SkylinkNet WebSocket PONG"
                                 )
@@ -684,12 +897,22 @@ class SkylinkNetCoordinator:
                                 error = ws.exception()
 
                                 self.websocket_last_error = (
-                                    str(error)
+                                    sanitize_exception(
+                                        error,
+                                        self.api.secrets,
+                                    )
+                                    if error is not None
+                                    else "WebSocket error"
+                                )
+                                self.websocket_last_error_kind = (
+                                    type(error).__name__
+                                    if error is not None
+                                    else "unknown"
                                 )
 
                                 _LOGGER.error(
                                     "SkylinkNet WebSocket error: %s",
-                                    error,
+                                    self.websocket_last_error,
                                 )
 
                                 break
@@ -712,12 +935,20 @@ class SkylinkNetCoordinator:
             except Exception as err:
                 self.websocket_error_count += 1
 
-                self.websocket_last_error = str(
-                    err
+                self.websocket_last_error = sanitize_exception(
+                    err,
+                    self.api.secrets,
                 )
+                self.websocket_last_error_kind = type(err).__name__
 
-                _LOGGER.exception(
-                    "SkylinkNet WebSocket connection failed"
+                # _LOGGER.exception() would format err's own traceback,
+                # which (for aiohttp connection errors) can embed the
+                # WebSocket URL with hub_key. Log the sanitized summary
+                # instead; the sanitized value is what diagnostics and
+                # websocket_last_error already expose.
+                _LOGGER.error(
+                    "SkylinkNet WebSocket connection failed: %s",
+                    self.websocket_last_error,
                 )
 
             finally:
@@ -763,14 +994,133 @@ class SkylinkNetCoordinator:
             )
 
     # ============================================================
+    # WEBSOCKET -> REST RESYNC
+    #
+    # WS CONNECT -> REST snapshot -> apply -> continue live events.
+    #
+    # This runs BEFORE `async for message in ws:` starts consuming
+    # events (see _websocket_loop above), so a snapshot can never
+    # overwrite a WebSocket event that arrived later: there isn't one
+    # yet at that point. Single-flight via self._resync_lock, and
+    # merge-only: any device missing from this particular snapshot is
+    # left exactly as it was, never removed.
+    # ============================================================
+
+    async def _resync_after_connect(self) -> None:
+        """Fetch a fresh REST snapshot right after (re)connecting."""
+
+        if self._resync_lock.locked():
+            # Another resync is already in flight (should not happen
+            # given the call site, but this keeps it single-flight
+            # even if that ever changes).
+            return
+
+        async with self._resync_lock:
+
+            try:
+                read = await self.api.read_devices()
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as err:
+                _LOGGER.warning(
+                    "SkylinkNet post-connect resync failed: %s",
+                    sanitize_exception(
+                        err,
+                        self.api.secrets,
+                    ),
+                )
+                return
+
+            self._apply_resync_snapshot(read)
+
+    def _apply_resync_snapshot(
+        self,
+        read: Any,
+    ) -> None:
+        """Merge a REST snapshot into current devices/states.
+
+        Devices absent from ``read`` are left untouched (NOT removed):
+        a snapshot only ever adds/updates what it actually contains.
+        """
+
+        if not isinstance(read, dict):
+            return
+
+        data = read.get("data")
+
+        if not isinstance(data, list):
+            return
+
+        persist = False
+
+        for item in data:
+
+            if not isinstance(item, dict):
+                continue
+
+            dev_id = item.get("dev_id")
+
+            if not dev_id or dev_id == ALARM_DEVICE_ID:
+                continue
+
+            if dev_id in self.ignored_device_ids:
+                continue
+
+            old_state = self.states.get(dev_id)
+            new_state = dict(item)
+
+            if old_state == new_state:
+                continue
+
+            is_new = dev_id not in self.known_device_ids
+
+            self.states[dev_id] = new_state
+
+            if dev_id not in self.devices:
+                self.devices[dev_id] = {"dev_id": dev_id}
+
+            if is_new:
+                self.known_device_ids.add(dev_id)
+                persist = True
+
+                _LOGGER.info(
+                    "SkylinkNet discovered new device via resync: %s",
+                    dev_id,
+                )
+
+                self._notify_new_device_listeners(dev_id)
+            else:
+                persist = True
+
+            self._notify_listeners(dev_id)
+
+        if persist:
+            self.hass.async_create_task(
+                self.async_save_persisted()
+            )
+
+        # Same restore logic used at startup; it only ever sets
+        # alarm_state from the virtual alarm device (F0000000) and
+        # never invents a state that read() did not contain.
+        self.update_alarm_state_from_read(read)
+
+    # ============================================================
     # PROCESS MESSAGE
     # ============================================================
 
     def _process_message(
         self,
         message: str,
-    ) -> None:
-        """Process WebSocket message."""
+    ) -> bool:
+        """Process WebSocket message.
+
+        Returns True when the message was valid JSON that could be
+        interpreted (used for the "last_useful_message"/
+        "invalid_message_count" diagnostics); False for anything that
+        was not a usable JSON object.
+        """
 
         _LOGGER.debug(
             "SkylinkNet WebSocket RX: %s",
@@ -785,10 +1135,10 @@ class SkylinkNetCoordinator:
                 "SkylinkNet non-JSON message: %s",
                 message,
             )
-            return
+            return False
 
         if not isinstance(data, dict):
-            return
+            return False
 
         op = data.get("op")
         hub_id = data.get("hub_id")
@@ -813,7 +1163,7 @@ class SkylinkNetCoordinator:
 
                 self._ingest_device_item(item)
 
-            return
+            return True
 
         # Single device.
         if isinstance(payload, dict):
@@ -821,6 +1171,8 @@ class SkylinkNetCoordinator:
             self._ingest_device_item(
                 payload
             )
+
+        return True
 
     # ============================================================
     # DEVICE MESSAGE
@@ -996,6 +1348,8 @@ class SkylinkNetCoordinator:
 
             self.alarm_state = "disarmed"
 
+            self._note_arm_confirmed("websocket")
+
             self._notify_monitor_listeners()
 
             return
@@ -1014,6 +1368,8 @@ class SkylinkNetCoordinator:
             self._entry_delay = False
 
             self.alarm_state = "armed_home"
+
+            self._note_arm_confirmed("websocket")
 
             self._notify_monitor_listeners()
 
@@ -1065,6 +1421,8 @@ class SkylinkNetCoordinator:
                         "armed_away"
                     )
 
+                    self._note_arm_confirmed("websocket")
+
                 else:
 
                     self._entry_delay = True
@@ -1089,6 +1447,8 @@ class SkylinkNetCoordinator:
                 self.alarm_state = (
                     "armed_away"
                 )
+
+                self._note_arm_confirmed("websocket")
 
             self._notify_monitor_listeners()
 
@@ -1150,8 +1510,9 @@ class SkylinkNetCoordinator:
     def update_alarm_state_from_read(
         self,
         read: Any,
+        confirmed_via: str = "rest",
     ) -> None:
-        """Restore alarm state from initial read response.
+        """Restore alarm state from a read() response.
 
         The SkylinkNet REST get_hub_status response does not contain
         the alarm state.
@@ -1161,8 +1522,11 @@ class SkylinkNetCoordinator:
             F0000000 status=4 -> disarmed
             F0000000 status=3 -> armed away
 
-        This method is called once during integration startup,
-        before entities are created.
+        Called during integration startup (before entities are
+        created), after every WebSocket (re)connect (resync, see
+        _resync_after_connect()), and by the arm-confirmation
+        watchdog (confirmed_via="rest_watchdog") — always with the
+        SAME restore logic, so the three sources cannot disagree.
         """
 
         if not isinstance(
@@ -1283,18 +1647,21 @@ class SkylinkNetCoordinator:
                 return
 
             _LOGGER.info(
-                "SkylinkNet initial alarm state restored: "
+                "SkylinkNet alarm state restored from REST (%s): "
                 "status=%s state=%s",
+                confirmed_via,
                 status,
                 self.alarm_state,
             )
+
+            self._note_arm_confirmed(confirmed_via)
 
             self._notify_monitor_listeners()
 
             return
 
         _LOGGER.warning(
-            "SkylinkNet initial read does not contain "
+            "SkylinkNet read response does not contain "
             "alarm device %s",
             ALARM_DEVICE_ID,
         )
@@ -1601,7 +1968,12 @@ class SkylinkNetCoordinator:
     def get_websocket_info(
         self,
     ) -> dict[str, Any]:
-        """Return WebSocket diagnostics."""
+        """Return WebSocket diagnostics.
+
+        Existing keys are kept exactly as before (same names/values)
+        for compatibility with anything already reading them; new
+        keys are additive.
+        """
 
         return {
             "connected": self.websocket_connected,
@@ -1610,6 +1982,9 @@ class SkylinkNetCoordinator:
             ),
             "disconnect_count": (
                 self.websocket_disconnect_count
+            ),
+            "reconnect_count": (
+                self.websocket_reconnect_count
             ),
             "message_count": (
                 self.websocket_message_count
@@ -1620,9 +1995,41 @@ class SkylinkNetCoordinator:
             "last_error": (
                 self.websocket_last_error
             ),
+            "last_error_kind": (
+                self.websocket_last_error_kind
+            ),
             "reconnect_delay": (
                 self.websocket_reconnect_delay
             ),
+            # New, finer-grained fields (see __init__ for what each
+            # one means, in particular why heartbeat_count is
+            # normally 0 with aiohttp autoping=True).
+            "last_activity": _iso(self.websocket_last_message),
+            "last_heartbeat": _iso(self.websocket_last_heartbeat),
+            "last_useful_message": _iso(
+                self.websocket_last_useful_message
+            ),
+            "heartbeat_count": self.websocket_heartbeat_count,
+            "invalid_message_count": (
+                self.websocket_invalid_message_count
+            ),
+            "last_connect": _iso(self.websocket_last_connect),
+            "last_disconnect": _iso(self.websocket_last_disconnect),
+        }
+
+    def get_last_arm_info(self) -> dict[str, Any] | None:
+        """Return diagnostics for the most recent arm/disarm command."""
+
+        if self.last_arm is None:
+            return None
+
+        return {
+            key: (
+                _iso(value)
+                if key in ("requested_at", "confirmed_at")
+                else value
+            )
+            for key, value in self.last_arm.items()
         }
 
     # ============================================================
@@ -1636,6 +2043,8 @@ class SkylinkNetCoordinator:
     ) -> bool:
         """Set SkylinkNet alarm state."""
 
+        self._note_arm_requested(alarm)
+
         try:
             result = await self.api.set_alarm(
                 alarm,
@@ -1643,10 +2052,18 @@ class SkylinkNetCoordinator:
             )
 
         except Exception as err:
+            message = sanitize_exception(
+                err,
+                self.api.secrets,
+            )
+
             _LOGGER.error(
                 "SkylinkNet alarm command failed: %s",
-                err,
+                message,
             )
+
+            self._note_arm_result(f"rest_failed: {message}")
+
             return False
 
         if not isinstance(
@@ -1657,6 +2074,9 @@ class SkylinkNetCoordinator:
                 "SkylinkNet alarm returned invalid response: %s",
                 result,
             )
+
+            self._note_arm_result("invalid_response")
+
             return False
 
         try:
@@ -1677,7 +2097,12 @@ class SkylinkNetCoordinator:
                 "SkylinkNet alarm command failed: %s",
                 result,
             )
+
+            self._note_arm_result(f"rejected: errno={errno}")
+
             return False
+
+        self._note_arm_result("accepted")
 
         arming_mode = {
             "disarm": "disarmed",
