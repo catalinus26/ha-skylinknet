@@ -1264,6 +1264,48 @@ class SkylinkNetCoordinator:
 
         payload = data.get("data")
 
+        # A WebSocket ``op="read"`` is a complete state SNAPSHOT (seen
+        # in debug logs right after connect and ~1 s after each REST
+        # /api/dev/read), not a live event. A stable status in a snapshot
+        # must therefore go through the same restore logic as the REST read. Treating it
+        # as an event made status=3 on an already armed-away alarm look
+        # like an "entry delay" (-> pending), and the watchdog re-armed
+        # by that pending was cancelled by the next snapshot, so the
+        # entity stayed in "pending" indefinitely.
+        #
+        # Only the stable statuses 2/3/4 are handled here; anything
+        # else (5/6/7, missing, invalid) keeps the existing path.
+        if data.get("op") == "read" and isinstance(payload, list):
+
+            for item in payload:
+
+                if (
+                    not isinstance(item, dict)
+                    or item.get("dev_id") != ALARM_DEVICE_ID
+                ):
+                    continue
+
+                try:
+                    snapshot_status = int(item.get("status"))
+                except (TypeError, ValueError):
+                    break
+
+                if snapshot_status in (
+                    ALARM_CODE_ARMED_HOME,
+                    ALARM_STATUS_ARMED_AWAY,
+                    ALARM_STATUS_DISARMED,
+                ):
+                    self._cancel_arm_confirmation()
+
+                    self.update_alarm_state_from_read(
+                        data,
+                        confirmed_via="websocket_read",
+                    )
+
+                    return
+
+                break
+
         items: list[dict[str, Any]] = []
 
         items.append(data)
